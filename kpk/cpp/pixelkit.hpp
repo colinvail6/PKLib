@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cerrno>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -364,13 +365,34 @@ private:
         _send(msg, sizeof msg - 1);
     }
 
-    /* Send with null padding to multiple of PAD_LEN */
+    /* Send with null padding to multiple of PAD_LEN.
+     *
+     * write() is never guaranteed to send the whole buffer in one call —
+     * it can return early (a "short write") on signal interruption, or
+     * here specifically because connect() enables XON/XOFF software flow
+     * control: if the MCU asserts XOFF mid-transmission to pause the
+     * host, write() returns having sent only part of the buffer, with no
+     * error (errno isn't set, n is just smaller than requested). Treating
+     * that partial count as "done" — the previous behavior — silently
+     * truncates the message, corrupting the MCU's fixed-padding framing
+     * (every command must land on a PAD_LEN-byte boundary). This loops
+     * until every byte is actually sent, retrying on both a short write
+     * and EINTR, and only gives up on a genuine error. */
     void _send(const char *msg, int len) {
         int padded = ((len / PAD_LEN) + 1) * PAD_LEN;
         char *buf  = (char *)calloc(padded, 1);
         memcpy(buf, msg, len);
-        ssize_t n  = write(fd, buf, padded);
-        if (n < 0) perror("write");
+
+        int sent = 0;
+        while (sent < padded) {
+            ssize_t n = write(fd, buf + sent, padded - sent);
+            if (n < 0) {
+                if (errno == EINTR) continue;   // interrupted — retry
+                perror("write");
+                break;                           // real error — give up
+            }
+            sent += (int)n;
+        }
         free(buf);
     }
 };
